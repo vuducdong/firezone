@@ -8,6 +8,8 @@ defmodule PortalWeb.OIDC do
 
   alias Portal.{Google, Okta, Entra, OIDC}
 
+  require Logger
+
   @doc """
   Builds OpenIDConnect configuration for a provider.
   Supports Google, Okta, Entra, and generic OIDC providers.
@@ -228,6 +230,7 @@ defmodule PortalWeb.OIDC do
   Builds the IdP URI for the verification flow. For OIDC types this is an
   authorization URI with PKCE; for Entra types it is an admin consent URI.
   The state_token (from sign_verification_state/2) is passed through the IdP unchanged.
+  Accepts types: "google", "okta", "oidc", "entra", "entra_directory_sync".
   Returns {:ok, uri} or {:error, reason}.
   """
   def build_verification_uri(type, config, verifier, state_token)
@@ -261,7 +264,8 @@ defmodule PortalWeb.OIDC do
   end
 
   def build_verification_uri(type, _config, _verifier, _state_token) do
-    {:error, "Unknown verification type: #{type}"}
+    Logger.error("Unknown verification type", type: type)
+    {:error, :unknown_verification_type}
   end
 
   @doc """
