@@ -95,22 +95,6 @@ defmodule Portal.Account do
     for(_ <- 1..6, into: "", do: <<Enum.at(@base36, uniform(36))>>)
   end
 
-  @spec active?(t()) :: boolean()
-  def active?(%__MODULE__{disabled_at: nil}), do: true
-  def active?(%__MODULE__{}), do: false
-
-  # sobelow_skip ["DOS.BinToAtom"]
-  for feature <- Portal.Accounts.Features.__schema__(:fields) do
-    def unquote(:"#{feature}_enabled?")(account) do
-      Config.global_feature_enabled?(unquote(feature)) and
-        account_feature_enabled?(account, unquote(feature))
-    end
-  end
-
-  defp account_feature_enabled?(account, feature) do
-    Map.fetch!(account.features || %Portal.Accounts.Features{}, feature) || false
-  end
-
   # Rejection sampling to avoid modulo bias.
   # Largest multiple of 36 that fits in a byte is 252 (36 * 7).
   defp uniform(n) do
@@ -125,6 +109,22 @@ defmodule Portal.Account do
 
   defp validate_key_format(changeset) do
     validate_format(changeset, :key, ~r/^[a-z0-9]+$/, message: "must be lowercase alphanumeric")
+  end
+
+  @spec active?(t()) :: boolean()
+  def active?(%__MODULE__{disabled_at: nil}), do: true
+  def active?(%__MODULE__{}), do: false
+
+  # sobelow_skip ["DOS.BinToAtom"]
+  for feature <- Portal.Accounts.Features.__schema__(:fields) do
+    def unquote(:"#{feature}_enabled?")(account) do
+      Config.global_feature_enabled?(unquote(feature)) and
+        account_feature_enabled?(account, unquote(feature))
+    end
+  end
+
+  defp account_feature_enabled?(account, feature) do
+    Map.fetch!(account.features || %Portal.Accounts.Features{}, feature) || false
   end
 end
 
