@@ -177,8 +177,10 @@ impl TunnelTest {
                                     true
                                 });
                             }
-                            client::Resource::Cidr(_) => {}
-                            client::Resource::Internet(_) => {}
+                            client::Resource::Cidr(_)
+                            | client::Resource::Internet(_)
+                            | client::Resource::StaticDevicePool(_)
+                            | client::Resource::DynamicDevicePool(_) => {}
                         }
 
                         c.sut.add_resource(resource.clone(), now);

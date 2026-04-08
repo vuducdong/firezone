@@ -33,7 +33,7 @@ const REVERSE_DNS_ADDRESS_END: &str = "arpa";
 const REVERSE_DNS_ADDRESS_V4: &str = "in-addr";
 const REVERSE_DNS_ADDRESS_V6: &str = "ip6";
 
-pub struct StubResolver {
+pub struct ResourceStubResolver {
     fqdn_to_ips: BTreeMap<(dns_types::DomainName, ResourceId), Vec<IpAddr>>,
     ips_to_fqdn: HashMap<IpAddr, (dns_types::DomainName, ResourceId)>,
     ip_provider: IpProvider,
@@ -61,13 +61,13 @@ struct Resource {
     ip_stack: IpStack,
 }
 
-impl Default for StubResolver {
+impl Default for ResourceStubResolver {
     fn default() -> Self {
-        StubResolver::new(Default::default())
+        ResourceStubResolver::new(Default::default())
     }
 }
 
-impl StubResolver {
+impl ResourceStubResolver {
     pub(crate) fn new(records: BTreeSet<DnsResourceRecord>) -> Self {
         let mut ips_to_fqdn = HashMap::default();
         let mut fqdn_to_ips = BTreeMap::default();
@@ -100,7 +100,7 @@ impl StubResolver {
             let _ = ip_provider.get_n_ipv6(num_ip6_records);
         }
 
-        StubResolver {
+        ResourceStubResolver {
             fqdn_to_ips,
             ips_to_fqdn,
             ip_provider,
@@ -325,6 +325,49 @@ pub struct DnsResourceRecord {
     pub ips: Vec<IpAddr>,
 }
 
+#[derive(Default)]
+pub struct DeviceStubResolver {
+    device_pools: BTreeMap<Pattern, ResourceId>,
+}
+
+impl DeviceStubResolver {
+    pub(crate) fn add_resource(&mut self, id: ResourceId, pattern: String) -> bool {
+        let parsed = match Pattern::new(&pattern) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%pattern, "Device pool pattern is not valid: {}", err_with_src(&e));
+                return false;
+            }
+        };
+
+        self.device_pools.insert(parsed, id).is_none()
+    }
+
+    pub(crate) fn remove_resource(&mut self, id: ResourceId) {
+        self.device_pools.retain(|_, r| *r != id);
+    }
+
+    /// Attempts to match the given domain against device pool patterns.
+    ///
+    /// Returns the [`ResourceId`] of the first matching device pool, if any.
+    #[allow(dead_code)] // Will be used when DNS query interception is wired up.
+    pub(crate) fn match_device_pool_linear(
+        &self,
+        domain: &dns_types::DomainName,
+    ) -> Option<ResourceId> {
+        let name = Candidate::from_domain(domain);
+
+        for (pattern, id) in &self.device_pools {
+            if pattern.matches(&name) {
+                tracing::trace!(resource_id = %id, %pattern, %domain, "Matched device pool");
+                return Some(*id);
+            }
+        }
+
+        None
+    }
+}
+
 pub(crate) fn reverse_dns_addr(name: &str) -> Option<IpAddr> {
     let mut dns_parts = name.split('.').rev();
     if dns_parts.next()? != REVERSE_DNS_ADDRESS_END {
@@ -474,7 +517,7 @@ mod tests {
 
     #[test]
     fn prioritises_non_wildcard_over_wildcard_domain() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
         let wc = ResourceId::from_u128(0);
         let non_wc = ResourceId::from_u128(1);
 
@@ -495,7 +538,7 @@ mod tests {
 
     #[test]
     fn query_for_doh_canary_domain_records_nx_domain() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         let query = Query::new(
             "use-application-dns.net"
@@ -514,7 +557,7 @@ mod tests {
 
     #[test]
     fn a_query_for_ipv6_only_resource_yields_empty_set() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         resolver.add_resource(
             ResourceId::from_u128(1),
@@ -537,7 +580,7 @@ mod tests {
 
     #[test]
     fn aaaa_query_for_ipv4_only_resource_yields_empty_set() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         resolver.add_resource(
             ResourceId::from_u128(1),
@@ -560,7 +603,7 @@ mod tests {
 
     #[test]
     fn ip_stack_can_be_restricted_after_initial_query() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         resolver.add_resource(
             ResourceId::from_u128(1),
@@ -591,7 +634,7 @@ mod tests {
 
     #[test]
     fn ip_stack_is_honored_from_cached_records() {
-        let mut resolver = StubResolver::new(BTreeSet::from([DnsResourceRecord {
+        let mut resolver = ResourceStubResolver::new(BTreeSet::from([DnsResourceRecord {
             domain: "example.com".parse().unwrap(),
             resource: ResourceId::from_u128(1),
             ips: vec![
@@ -627,7 +670,7 @@ mod tests {
 
     #[test]
     fn emits_new_records_on_assign() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         resolver.add_resource(
             ResourceId::from_u128(1),
@@ -665,7 +708,7 @@ mod tests {
 
     #[test]
     fn repeated_queries_dont_emit_events() {
-        let mut resolver = StubResolver::default();
+        let mut resolver = ResourceStubResolver::default();
 
         resolver.add_resource(
             ResourceId::from_u128(1),
@@ -691,6 +734,65 @@ mod tests {
 
         assert!(resolver.poll_event().is_none());
     }
+
+    #[test]
+    fn dynamic_device_pool_wildcard_match() {
+        let mut resolver = DeviceStubResolver::default();
+        let rid = ResourceId::from_u128(1);
+        resolver.add_resource(rid, "*.devices.example.com".to_owned());
+
+        let matched =
+            resolver.match_device_pool_linear(&"foo.devices.example.com".parse().unwrap());
+
+        assert_eq!(matched, Some(rid));
+    }
+
+    #[test]
+    fn dynamic_device_pool_no_match_for_unrelated_domain() {
+        let mut resolver = DeviceStubResolver::default();
+        resolver.add_resource(ResourceId::from_u128(1), "*.devices.example.com".to_owned());
+
+        let matched = resolver.match_device_pool_linear(&"foo.other.example.com".parse().unwrap());
+
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn dynamic_device_pool_remove_resource() {
+        let mut resolver = DeviceStubResolver::default();
+        let rid = ResourceId::from_u128(1);
+        resolver.add_resource(rid, "*.devices.example.com".to_owned());
+
+        resolver.remove_resource(rid);
+
+        let matched =
+            resolver.match_device_pool_linear(&"foo.devices.example.com".parse().unwrap());
+
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn dynamic_device_pool_prioritises_specific_over_wildcard() {
+        let mut resolver = DeviceStubResolver::default();
+        let wildcard = ResourceId::from_u128(1);
+        let specific = ResourceId::from_u128(2);
+
+        resolver.add_resource(wildcard, "**.devices.example.com".to_owned());
+        resolver.add_resource(specific, "foo.devices.example.com".to_owned());
+
+        let matched =
+            resolver.match_device_pool_linear(&"foo.devices.example.com".parse().unwrap());
+
+        assert_eq!(matched, Some(specific));
+    }
+
+    #[test]
+    fn dynamic_device_pool_invalid_pattern_returns_false() {
+        let mut resolver = DeviceStubResolver::default();
+        let added = resolver.add_resource(ResourceId::from_u128(1), "[invalid".to_owned());
+
+        assert!(!added);
+    }
 }
 
 #[cfg(feature = "divan")]
@@ -705,7 +807,7 @@ mod benches {
     fn match_domain_linear<const NUM_RES: u128>(bencher: divan::Bencher) {
         bencher
             .with_inputs(|| {
-                let mut resolver = StubResolver::default();
+                let mut resolver = ResourceStubResolver::default();
                 let mut rng = rand::thread_rng();
 
                 for n in 0..NUM_RES {

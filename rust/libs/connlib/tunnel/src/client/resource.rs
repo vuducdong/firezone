@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 use crate::messages::client::{
     ResourceDescription, ResourceDescriptionCidr, ResourceDescriptionDns,
-    ResourceDescriptionInternet,
+    ResourceDescriptionDynamicDevicePool, ResourceDescriptionInternet,
+    ResourceDescriptionStaticDevicePool,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,6 +21,8 @@ pub enum Resource {
     Dns(DnsResource),
     Cidr(CidrResource),
     Internet(InternetResource),
+    StaticDevicePool(StaticDevicePoolResource),
+    DynamicDevicePool(DynamicDevicePoolResource),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -68,6 +71,26 @@ pub struct InternetResource {
     pub sites: Vec<Site>,
 }
 
+/// A static device pool resource.
+///
+/// Static device pools don't participate in DNS resolution on the client.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StaticDevicePoolResource {
+    pub id: ResourceId,
+    pub name: String,
+}
+
+/// A dynamic device pool resource.
+///
+/// Dynamic device pools have a DNS pattern that connlib matches against to resolve device addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DynamicDevicePoolResource {
+    pub id: ResourceId,
+    pub name: String,
+    /// DNS pattern for the pool (e.g. `*.devices.example.com`).
+    pub address: String,
+}
+
 impl Resource {
     pub fn from_description(resource: ResourceDescription) -> Option<Self> {
         match resource {
@@ -98,6 +121,28 @@ impl Resource {
 
                 Some(Resource::Internet(InternetResource::from_description(i)))
             }
+            ResourceDescription::StaticDevicePool(json) => {
+                let i = ResourceDescriptionStaticDevicePool::deserialize(&json)
+                    .inspect_err(|e| {
+                        tracing::warn!(%json, "Failed to deserialise `ResourceDescriptionStaticDevicePool`: {e}")
+                    })
+                    .ok()?;
+
+                Some(Resource::StaticDevicePool(
+                    StaticDevicePoolResource::from_description(i),
+                ))
+            }
+            ResourceDescription::DynamicDevicePool(json) => {
+                let i = ResourceDescriptionDynamicDevicePool::deserialize(&json)
+                    .inspect_err(|e| {
+                        tracing::warn!(%json, "Failed to deserialise `ResourceDescriptionDynamicDevicePool`: {e}")
+                    })
+                    .ok()?;
+
+                Some(Resource::DynamicDevicePool(
+                    DynamicDevicePoolResource::from_description(i),
+                ))
+            }
             ResourceDescription::Unknown => None,
         }
     }
@@ -106,7 +151,10 @@ impl Resource {
     pub fn into_dns(self) -> Option<DnsResource> {
         match self {
             Resource::Dns(d) => Some(d),
-            Resource::Cidr(_) | Resource::Internet(_) => None,
+            Resource::Cidr(_)
+            | Resource::Internet(_)
+            | Resource::StaticDevicePool(_)
+            | Resource::DynamicDevicePool(_) => None,
         }
     }
 
@@ -114,7 +162,8 @@ impl Resource {
         match self {
             Resource::Dns(d) => Some(d.address.clone()),
             Resource::Cidr(c) => Some(c.address.to_string()),
-            Resource::Internet(_) => None,
+            Resource::DynamicDevicePool(r) => Some(r.address.clone()),
+            Resource::Internet(_) | Resource::StaticDevicePool(_) => None,
         }
     }
 
@@ -127,6 +176,8 @@ impl Resource {
             Resource::Dns(r) => r.id,
             Resource::Cidr(r) => r.id,
             Resource::Internet(r) => r.id,
+            Resource::StaticDevicePool(r) => r.id,
+            Resource::DynamicDevicePool(r) => r.id,
         }
     }
 
@@ -135,6 +186,7 @@ impl Resource {
             Resource::Dns(r) => BTreeSet::from_iter(r.sites.iter()),
             Resource::Cidr(r) => BTreeSet::from_iter(r.sites.iter()),
             Resource::Internet(r) => BTreeSet::from_iter(r.sites.iter()),
+            Resource::StaticDevicePool(_) | Resource::DynamicDevicePool(_) => BTreeSet::new(),
         }
     }
 
@@ -151,6 +203,8 @@ impl Resource {
             Resource::Dns(r) => &r.name,
             Resource::Cidr(r) => &r.name,
             Resource::Internet(_) => "Internet",
+            Resource::StaticDevicePool(r) => &r.name,
+            Resource::DynamicDevicePool(r) => &r.name,
         }
     }
 
@@ -158,7 +212,9 @@ impl Resource {
         match self {
             Resource::Dns(r) => r.address_description.as_deref(),
             Resource::Cidr(r) => r.address_description.as_deref(),
-            Resource::Internet(_) => None,
+            Resource::Internet(_)
+            | Resource::StaticDevicePool(_)
+            | Resource::DynamicDevicePool(_) => None,
         }
     }
 
@@ -166,7 +222,11 @@ impl Resource {
         match (self, other) {
             (Resource::Dns(dns_a), Resource::Dns(dns_b)) => dns_a.address != dns_b.address,
             (Resource::Cidr(cidr_a), Resource::Cidr(cidr_b)) => cidr_a.address != cidr_b.address,
-            (Resource::Internet(_), Resource::Internet(_)) => false,
+            (Resource::Internet(_), Resource::Internet(_))
+            | (Resource::StaticDevicePool(_), Resource::StaticDevicePool(_)) => false,
+            (Resource::DynamicDevicePool(a), Resource::DynamicDevicePool(b)) => {
+                a.address != b.address
+            }
             _ => true,
         }
     }
@@ -184,7 +244,9 @@ impl Resource {
 
     pub fn addresses(&self) -> Vec<IpNetwork> {
         match self {
-            Resource::Dns(_) => vec![],
+            Resource::Dns(_) | Resource::StaticDevicePool(_) | Resource::DynamicDevicePool(_) => {
+                vec![]
+            }
             Resource::Cidr(c) => vec![c.address],
             Resource::Internet(_) => vec![
                 Ipv4Network::DEFAULT_ROUTE.into(),
@@ -193,11 +255,15 @@ impl Resource {
         }
     }
 
-    pub fn with_status(self, status: ResourceStatus) -> ResourceView {
+    /// Converts this resource into a [`ResourceView`] for the UI.
+    ///
+    /// Returns `None` for resource types that don't have a UI representation yet.
+    pub fn with_status(self, status: ResourceStatus) -> Option<ResourceView> {
         match self {
-            Resource::Dns(r) => ResourceView::Dns(r.with_status(status)),
-            Resource::Cidr(r) => ResourceView::Cidr(r.with_status(status)),
-            Resource::Internet(r) => ResourceView::Internet(r.with_status(status)),
+            Resource::Dns(r) => Some(ResourceView::Dns(r.with_status(status))),
+            Resource::Cidr(r) => Some(ResourceView::Cidr(r.with_status(status))),
+            Resource::Internet(r) => Some(ResourceView::Internet(r.with_status(status))),
+            Resource::StaticDevicePool(_) | Resource::DynamicDevicePool(_) => None,
         }
     }
 
@@ -216,6 +282,8 @@ impl Resource {
                 sites: vec![site],
                 ..r
             }),
+            Resource::StaticDevicePool(r) => Self::StaticDevicePool(r),
+            Resource::DynamicDevicePool(r) => Self::DynamicDevicePool(r),
         }
     }
 }
@@ -270,6 +338,25 @@ impl InternetResource {
             id: self.id,
             sites: self.sites,
             status,
+        }
+    }
+}
+
+impl StaticDevicePoolResource {
+    pub fn from_description(resource: ResourceDescriptionStaticDevicePool) -> Self {
+        Self {
+            id: resource.id,
+            name: resource.name,
+        }
+    }
+}
+
+impl DynamicDevicePoolResource {
+    pub fn from_description(resource: ResourceDescriptionDynamicDevicePool) -> Self {
+        Self {
+            id: resource.id,
+            name: resource.name,
+            address: resource.address,
         }
     }
 }
