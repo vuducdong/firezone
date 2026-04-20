@@ -194,7 +194,7 @@ impl ClientState {
             is_internet_resource_active,
             buffered_dns_queries: Default::default(),
             udp_dns_client: l3_udp_dns_client::Client::new(seed),
-            tcp_dns_client: dns_over_tcp::Client::new(now, seed),
+            tcp_dns_client: dns_over_tcp::Client::new(now, Duration::from_secs(10), seed),
             tcp_dns_server: dns_over_tcp::Server::new(now),
             dns_streams_by_local_upstream_and_query_id: Default::default(),
             pending_flows: Default::default(),
@@ -1859,6 +1859,7 @@ impl ClientState {
             self.log_activating_resource(&new_resource);
         }
 
+        self.drain_stub_resolver_events();
         self.maybe_update_tun_routes();
         self.resource_list.update(self.resources());
         self.dns_cache.flush("Resource added");
