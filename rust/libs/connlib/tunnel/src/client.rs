@@ -1,53 +1,50 @@
+pub(crate) mod dns_config;
+
 mod client_on_client;
 mod dns_cache;
-pub(crate) mod dns_config;
 mod dns_resource_nat;
 mod gateway_on_client;
 mod pending_device_access;
 mod pending_flows;
 mod resource;
-
 mod tracked_state;
 
 pub(crate) use crate::client::client_on_client::ClientOnClient;
 pub(crate) use crate::client::gateway_on_client::GatewayOnClient;
-
-use crate::client::dns_config::DnsConfig;
-use crate::client::pending_device_access::PendingDeviceAccessRequests;
-use crate::client::pending_flows::{ConnectionTrigger, DnsQueryForSite, PendingFlows};
-use crate::client::tracked_state::TrackedState;
-use crate::filter_engine::FilterEngine;
-use crate::messages::client::FailReason;
-use crate::routing_table::{RouteEntry, RoutingTable};
-use boringtun::x25519;
+use crate::unroutable_packet::UnroutablePacket;
 #[cfg(all(feature = "proptest", test))]
 pub(crate) use resource::{CidrResource, DnsResource};
 pub(crate) use resource::{InternetResource, Resource};
 
-use dns_resource_nat::DnsResourceNat;
-use dns_types::{DomainName, ResponseCode};
-use ringbuffer::RingBuffer;
-use secrecy::ExposeSecret as _;
-use telemetry::{analytics, feature_flags};
-
 use crate::client::dns_cache::DnsCache;
+use crate::client::dns_config::DnsConfig;
+use crate::client::pending_device_access::PendingDeviceAccessRequests;
+use crate::client::pending_flows::{ConnectionTrigger, DnsQueryForSite, PendingFlows};
+use crate::client::tracked_state::TrackedState;
 use crate::dns::{DeviceStubResolver, DnsResourceRecord, ResourceStubResolver, stub_resolver};
-use crate::messages::{IceCredentials, SecretKey};
-use crate::messages::{IceRole, Interface as InterfaceConfig};
+use crate::filter_engine::FilterEngine;
+use crate::messages::{
+    IceCredentials, IceRole, Interface as InterfaceConfig, SecretKey, client::FailReason,
+};
 use crate::peer_store::PeerStore;
+use crate::routing_table::{RouteEntry, RoutingTable};
+use crate::{ClientEvent, FailedToDecapsulate, packet_kind};
 use crate::{IPV4_TUNNEL, IPV6_TUNNEL, IpConfig, TunConfig, dns, is_peer, p2p_control};
-use anyhow::{Context, ErrorExt};
+use anyhow::{Context, ErrorExt, Result, bail};
+use boringtun::x25519;
 use connlib_model::{
     ClientId, ClientOrGatewayId, GatewayId, IceCandidate, PublicKey, RelayId, ResourceId,
     ResourceStatus, ResourceView,
 };
 use connlib_model::{Site, SiteId};
+use dns_resource_nat::DnsResourceNat;
+use dns_types::{DomainName, ResponseCode};
 use ip_network::{IpNetwork, Ipv4Network, Ipv6Network};
 use ip_packet::{IpPacket, MAX_UDP_PAYLOAD, Protocol};
 use itertools::Itertools;
 use logging::{unwrap_or_debug, unwrap_or_warn};
-
-use crate::ClientEvent;
+use ringbuffer::RingBuffer;
+use secrecy::ExposeSecret as _;
 use snownet::{NoTurnServers, Node, RelaySocket, Transmit};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -55,6 +52,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 use std::{io, iter};
+use telemetry::{analytics, feature_flags};
 
 pub(crate) const IPV4_RESOURCES: Ipv4Network =
     match Ipv4Network::new(Ipv4Addr::new(100, 96, 0, 0), 11) {
@@ -400,33 +398,31 @@ impl ClientState {
         &mut self,
         packet: IpPacket,
         now: Instant,
-    ) -> Option<snownet::Transmit> {
+    ) -> Result<Option<snownet::Transmit>> {
         if packet.is_fz_p2p_control() {
             tracing::warn!("Packet matches heuristics of FZ p2p control protocol");
         }
 
         if packet.destination().is_multicast() {
-            return None;
+            return Ok(None);
         }
 
-        let tun_config = self.tun_config.current()?;
+        let tun_config = self
+            .tun_config
+            .current()
+            .context("TUN device not configured")?;
 
-        if !tun_config.ip.is_ip(packet.source()) {
-            tracing::debug!(?packet, "Dropping packet with bad source IP");
-
-            return None;
-        }
-
-        let dst = packet.destination();
-
-        if tun_config.ip.is_ip(dst) {
-            tracing::trace!(%dst, "Dropping packet destined to local tunnel IP");
-
-            return None;
-        }
+        anyhow::ensure!(
+            tun_config.ip.is_ip(packet.source()),
+            UnroutablePacket::not_tunnel_source_ip(&packet)
+        );
+        anyhow::ensure!(
+            !tun_config.ip.is_ip(packet.destination()),
+            UnroutablePacket::packet_to_self(&packet)
+        );
 
         let non_dns_packet = match self.try_handle_dns(packet, now) {
-            ControlFlow::Break(()) => return None,
+            ControlFlow::Break(()) => return Ok(None),
             ControlFlow::Continue(non_dns_packet) => non_dns_packet,
         };
 
@@ -445,32 +441,30 @@ impl ClientState {
         from: SocketAddr,
         packet: &[u8],
         now: Instant,
-    ) -> Option<IpPacket> {
-        let (pid, packet) = self.node.decapsulate(
-            local,
-            from,
-            packet.as_ref(),
-            now,
-        )
-        .inspect_err(|e| tracing::debug!(%local, %from, num_bytes = %packet.len(), "Failed to decapsulate: {e:#}"))
-        .ok()??;
+    ) -> Result<Option<IpPacket>> {
+        let Some((pid, packet)) = self
+            .node
+            .decapsulate(local, from, packet.as_ref(), now)
+            .with_context(|| FailedToDecapsulate(packet_kind::classify(packet)))?
+        else {
+            return Ok(None);
+        };
 
         if matches!(pid, ClientOrGatewayId::Gateway(_)) && self.udp_dns_client.accepts(&packet) {
             self.udp_dns_client.handle_inbound(packet);
-            return None;
+            return Ok(None);
         }
 
         if matches!(pid, ClientOrGatewayId::Gateway(_)) && self.tcp_dns_client.accepts(&packet) {
             self.tcp_dns_client.handle_inbound(packet);
-            return None;
+            return Ok(None);
         }
 
         if let Some(fz_p2p_control) = packet.as_fz_p2p_control() {
             match (fz_p2p_control.event_type(), pid) {
                 (p2p_control::DOMAIN_STATUS_EVENT, ClientOrGatewayId::Gateway(gid)) => {
                     let res = p2p_control::dns_resource_nat::decode_domain_status(fz_p2p_control)
-                        .inspect_err(|e| tracing::debug!("{e:#}"))
-                        .ok()?;
+                        .context("Failed to decode `DomainStatus`")?;
 
                     let buffered_packets = self.dns_resource_nat.on_domain_status(gid, res);
 
@@ -499,7 +493,7 @@ impl ClientState {
                 }
             };
 
-            return None;
+            return Ok(None);
         }
 
         match pid {
@@ -507,19 +501,17 @@ impl ClientState {
                 let Some(_peer) = self.clients.peer_by_id_mut(&cid) else {
                     tracing::error!(%cid, "Couldn't find connection by ID");
 
-                    return None;
+                    return Ok(None);
                 };
             }
             ClientOrGatewayId::Gateway(gid) => {
                 let Some(peer) = self.gateways.peer_by_id_mut(&gid) else {
                     tracing::error!(%gid, "Couldn't find connection by ID");
 
-                    return None;
+                    return Ok(None);
                 };
 
-                peer.ensure_allowed_src(&packet)
-                    .inspect_err(|e| tracing::debug!(%gid, %local, %from, "{e}"))
-                    .ok()?;
+                peer.ensure_allowed_src(&packet)?;
 
                 if feature_flags::icmp_error_unreachable_prohibited_create_new_flow()
                     && let Ok(Some((failed_packet, error))) = packet.icmp_error()
@@ -540,7 +532,7 @@ impl ClientState {
             }
         }
 
-        Some(packet)
+        Ok(Some(packet))
     }
 
     pub(crate) fn handle_dns_response(&mut self, response: dns::RecursiveResponse, now: Instant) {
@@ -600,14 +592,18 @@ impl ClientState {
         }
     }
 
-    fn encapsulate(&mut self, packet: IpPacket, now: Instant) -> Option<snownet::Transmit> {
+    fn encapsulate(&mut self, packet: IpPacket, now: Instant) -> Result<Option<snownet::Transmit>> {
         let dst = packet.destination();
-        let dst_proto = packet.destination_protocol().ok()?; // TODO: Error handling?
+        let dst_proto = packet.destination_protocol()?;
 
-        let (pid, mut packet) = if is_peer(dst) {
+        let maybe_packet = if is_peer(dst) {
             self.route_packet_to_peer(packet, now)?
         } else {
             self.route_packet_to_resource(packet, now)?
+        };
+
+        let Some((pid, mut packet)) = maybe_packet else {
+            return Ok(None);
         };
 
         if let Some((_, domain)) = self
@@ -616,66 +612,72 @@ impl ClientState {
             .map(|e| (e.resource_id, &e.domain))
             && let ClientOrGatewayId::Gateway(gid) = pid
         {
-            packet = self
+            match self
                 .dns_resource_nat
-                .handle_outgoing(gid, domain, packet, now)?;
+                .handle_outgoing(gid, domain, packet, now)
+            {
+                Some(p) => packet = p,
+                None => return Ok(None),
+            }
         }
 
-        let transmit = self
-            .node
-            .encapsulate(pid, &packet, now)
-            .inspect_err(|e| tracing::debug!(%pid, "Failed to encapsulate: {e:#}"))
-            .ok()??;
+        let transmit = match self.node.encapsulate(pid, &packet, now) {
+            Ok(Some(transmit)) => transmit,
+            Ok(None) => return Ok(None),
+            Err(e) if e.any_is::<snownet::UnknownConnection>() => {
+                return Err(e.context(UnroutablePacket::not_connected(&packet)));
+            }
+            Err(e) => return Err(e),
+        };
 
-        Some(transmit)
+        Ok(Some(transmit))
     }
 
     fn route_packet_to_peer(
         &mut self,
         packet: IpPacket,
         now: Instant,
-    ) -> Option<(ClientOrGatewayId, IpPacket)> {
+    ) -> Result<Option<(ClientOrGatewayId, IpPacket)>> {
         let dst = packet.destination();
 
         if let Some((id, _)) = self.gateways.peer_by_ip(dst) {
-            return Some((ClientOrGatewayId::Gateway(id), packet));
+            return Ok(Some((ClientOrGatewayId::Gateway(id), packet)));
         }
 
         if let Some((id, _)) = self.clients.peer_by_ip(dst) {
-            return Some((ClientOrGatewayId::Client(id), packet));
+            return Ok(Some((ClientOrGatewayId::Client(id), packet)));
         }
 
         let ipv4_addr = match dst {
             IpAddr::V4(ipv4_addr) => ipv4_addr,
-            IpAddr::V6(_) => return None, // Connecting to devices over IPv6 is not supported.
+            IpAddr::V6(_) => bail!("Connecting to devices over IPv6 is not supported."),
         };
 
         self.on_not_connected_device(ipv4_addr, packet, now);
 
-        None
+        Ok(None)
     }
 
     fn route_packet_to_resource(
         &mut self,
         packet: IpPacket,
         now: Instant,
-    ) -> Option<(ClientOrGatewayId, IpPacket)> {
+    ) -> Result<Option<(ClientOrGatewayId, IpPacket)>> {
         let dst = packet.destination();
-        let dst_proto = packet.destination_protocol().ok()?;
+        let dst_proto = packet.destination_protocol()?;
 
-        let Some(resource) = self.get_resource_by_destination(dst, dst_proto) else {
-            tracing::trace!(?packet, "Unknown resource");
-            return None;
-        };
+        let resource = self
+            .get_resource_by_destination(dst, dst_proto)
+            .with_context(|| UnroutablePacket::unknown_resource(&packet))?;
 
         let Some((gid, _)) =
             peer_by_resource_mut(&self.authorized_resources, &mut self.gateways, resource)
         else {
             self.on_not_connected_resource(resource, packet, now);
-            return None;
+            return Ok(None);
         };
 
-        Some((ClientOrGatewayId::Gateway(gid), packet))
+        Ok(Some((ClientOrGatewayId::Gateway(gid), packet)))
     }
 
     pub fn add_ice_candidate(
@@ -1246,8 +1248,13 @@ impl ClientState {
                 .or_else(|| self.udp_dns_client.poll_outbound())
             {
                 // All packets from the DNS clients _should_ go through the tunnel.
-                let Some(transmit) = self.encapsulate(packet, now) else {
-                    continue;
+                let transmit = match self.encapsulate(packet, now) {
+                    Ok(Some(transmit)) => transmit,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::debug!("{e:#}");
+                        continue;
+                    }
                 };
 
                 self.buffered_transmits.push_back(transmit);
@@ -2128,32 +2135,36 @@ mod tests {
     #[test]
     fn does_not_queue_device_access_intent_for_packet_to_own_tun_ipv4() {
         let mut state = ClientState::for_test();
-        let now = Instant::now();
         let tun_ipv4 = Ipv4Addr::new(100, 82, 80, 16);
-
         state.update_interface_config(interface(tun_ipv4, Ipv6Addr::LOCALHOST));
-        drain_events(&mut state);
 
         let packet = ip_packet::make::udp_packet(tun_ipv4, tun_ipv4, 137, 137, &[1]).unwrap();
 
-        assert!(state.handle_tun_input(packet, now).is_none());
+        assert_eq!(
+            state
+                .handle_tun_input(packet, Instant::now())
+                .unwrap_err()
+                .to_string(),
+            "Unroutable packet: Packet destination IP is TUN device"
+        );
         assert_no_device_connection_intent(&mut state);
     }
 
     #[test]
     fn does_not_queue_device_access_intent_for_packet_to_own_tun_ipv6() {
         let mut state = ClientState::for_test();
-        let now = Instant::now();
         let tun_ipv6 = Ipv6Addr::new(0xfd00, 0x2021, 0x1111, 0, 0, 0, 0, 1);
-
-        assert!(crate::is_peer(tun_ipv6.into()));
-
         state.update_interface_config(interface(Ipv4Addr::LOCALHOST, tun_ipv6));
-        drain_events(&mut state);
 
         let packet = ip_packet::make::udp_packet(tun_ipv6, tun_ipv6, 137, 137, &[1]).unwrap();
 
-        assert!(state.handle_tun_input(packet, now).is_none());
+        assert_eq!(
+            state
+                .handle_tun_input(packet, Instant::now())
+                .unwrap_err()
+                .to_string(),
+            "Unroutable packet: Packet destination IP is TUN device"
+        );
         assert_no_device_connection_intent(&mut state);
     }
 
@@ -2288,10 +2299,6 @@ mod tests {
             upstream_doh: vec![],
             search_domain: None,
         }
-    }
-
-    fn drain_events(state: &mut ClientState) {
-        while state.poll_event().is_some() {}
     }
 
     fn assert_no_device_connection_intent(state: &mut ClientState) {
