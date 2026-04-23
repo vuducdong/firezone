@@ -103,8 +103,8 @@ defmodule PortalWeb.Live.Clients.ShowTest do
     assert table["last started"]
     assert table["version"] =~ session.version
     assert table["user agent"] =~ session.user_agent
-    assert table["tunnel interface ipv4 address"] =~ to_string(client.ipv4_address.address)
-    assert table["tunnel interface ipv6 address"] =~ to_string(client.ipv6_address.address)
+    assert table["tunnel interface ipv4 address"] =~ to_string(client.ipv4)
+    assert table["tunnel interface ipv6 address"] =~ to_string(client.ipv6)
 
     table =
       lv
@@ -112,7 +112,7 @@ defmodule PortalWeb.Live.Clients.ShowTest do
       |> render()
       |> vertical_table_to_map()
 
-    assert table["file id"] == client.external_id
+    assert table["firezone id"] == client.firezone_id
 
     assert table["verification"] =~ "Not Verified"
     assert table["device serial"] =~ to_string(client.device_serial)
@@ -214,10 +214,13 @@ defmodule PortalWeb.Live.Clients.ShowTest do
       |> authorize_conn(actor)
       |> live(~p"/#{account}/clients/#{client}")
 
-    [row] =
+    html =
       lv
       |> element("#policy_authorizations")
       |> render()
+
+    [row] =
+      html
       |> table_to_map()
 
     assert row["authorized"]
@@ -225,8 +228,10 @@ defmodule PortalWeb.Live.Clients.ShowTest do
     assert row["policy"] =~ policy_authorization.policy.group.name
     assert row["policy"] =~ policy_authorization.policy.resource.name
 
-    assert row["gateway"] ==
+    assert row["receiver"] ==
              "#{policy_authorization.gateway.site.name}-#{policy_authorization.gateway.name} #{policy_authorization.gateway_remote_ip}"
+
+    assert html =~ ~s(href="/#{account.slug}/gateways/#{policy_authorization.gateway.id}")
   end
 
   test "does not render policy_authorizations for deleted policies", %{
@@ -348,6 +353,10 @@ defmodule PortalWeb.Live.Clients.ShowTest do
 
     assert_redirected(lv, ~p"/#{account}/clients")
 
-    refute Repo.get_by(Portal.Client, id: client.id, account_id: client.account_id)
+    refute Repo.get_by(Portal.Device,
+             id: client.id,
+             account_id: client.account_id,
+             type: :client
+           )
   end
 end

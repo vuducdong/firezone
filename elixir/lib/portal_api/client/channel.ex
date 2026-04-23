@@ -4,11 +4,11 @@ defmodule PortalAPI.Client.Channel do
 
   alias Portal.{
     Cache,
+    Device,
     PG,
     Changes.Change,
     Features,
     PubSub,
-    Gateway,
     Presence,
     Authentication
   }
@@ -73,26 +73,7 @@ defmodule PortalAPI.Client.Channel do
 
     {:noreply, socket} = register(socket)
 
-    push(socket, "init", %{
-      # TODO: Re-enable static_device_pool resources after verifying compatibility with older clients
-      resources:
-        resources
-        |> Enum.reject(&(&1.type == :static_device_pool))
-        |> Views.Resource.render_many(),
-      # TODO: Re-enable after verifying compatibility with older clients
-      # authorized_ipv4s: render_ipv4s(cache.authorized_device_ipv4s),
-      relays:
-        Views.Relay.render_many(
-          relays,
-          socket.assigns.session.public_key,
-          socket.assigns.subject.expires_at
-        ),
-      interface:
-        Views.Interface.render(%{
-          socket.assigns.client
-          | account: socket.assigns.subject.account
-        })
-    })
+    init(socket, resources, relays)
 
     {:noreply, socket}
   end
@@ -429,7 +410,7 @@ defmodule PortalAPI.Client.Channel do
         socket.assigns.subject.context.remote_ip_location_lon
       }
 
-      gateway = Gateway.load_balance_gateways(location, gateways, connected_gateway_ids)
+      gateway = Device.load_balance_gateways(location, gateways, connected_gateway_ids)
       gateway_public_key = gateway.latest_session.public_key
 
       policy_authorization_id = Ecto.UUID.generate()
@@ -566,7 +547,7 @@ defmodule PortalAPI.Client.Channel do
         socket.assigns.subject.context.remote_ip_location_lon
       }
 
-      gateway = Gateway.load_balance_gateways(location, gateways, connected_gateway_ids)
+      gateway = Device.load_balance_gateways(location, gateways, connected_gateway_ids)
 
       reply =
         {:ok,
@@ -635,8 +616,8 @@ defmodule PortalAPI.Client.Channel do
              {:allow_access, {self(), socket_ref(socket)},
               %{
                 client_id: socket.assigns.client.id,
-                client_ipv4: socket.assigns.client.ipv4_address.address,
-                client_ipv6: socket.assigns.client.ipv6_address.address,
+                client_ipv4: socket.assigns.client.ipv4,
+                client_ipv6: socket.assigns.client.ipv6,
                 resource: resource,
                 policy_authorization_id: policy_authorization_id,
                 authorization_expires_at: expires_at,
@@ -751,10 +732,20 @@ defmodule PortalAPI.Client.Channel do
            find_online_client_by_ipv4(account_id, ipv4_tuple) do
       client = socket.assigns.client
       client_public_key = socket.assigns.session.public_key
-      target_client = %Portal.Client{id: target_client_id, psk_base: target_meta.psk_base}
+
+      target_client = %Portal.Device{
+        id: target_client_id,
+        psk_base: target_meta.psk_base,
+        type: :client
+      }
 
       preshared_key =
-        Portal.Crypto.psk(client, client_public_key, target_client, target_meta.public_key)
+        Portal.Crypto.psk(
+          client,
+          client_public_key,
+          target_client,
+          target_meta.public_key
+        )
 
       ice_credentials =
         generate_ice_credentials(
@@ -772,11 +763,10 @@ defmodule PortalAPI.Client.Channel do
          %{
            client_id: client.id,
            client_name: client.name,
-           client_fqdns:
-             client_fqdns(client.ipv4_address && client.ipv4_address.address, account_key),
+           client_fqdns: client_fqdns(client.ipv4, account_key),
            client_public_key: client_public_key,
-           client_ipv4: client.ipv4_address && client.ipv4_address.address,
-           client_ipv6: client.ipv6_address && client.ipv6_address.address,
+           client_ipv4: client.ipv4,
+           client_ipv6: client.ipv6,
            preshared_key: preshared_key,
            local_ice_credentials: ice_credentials.receiver,
            remote_ice_credentials: ice_credentials.initiator,
@@ -1013,6 +1003,37 @@ defmodule PortalAPI.Client.Channel do
     assign(socket, :cached_relay_ids, cached_relay_ids)
   end
 
+  defp init(socket, resources, relays) do
+    push(socket, "init", %{
+      # TODO: Re-enable static_device_pool resources after verifying compatibility with older clients
+      resources:
+        resources
+        |> Enum.reject(&(&1.type == :static_device_pool))
+        |> Views.Resource.render_many(),
+      # TODO: Re-enable after verifying compatibility with older clients
+      # authorized_ipv4s: render_ipv4s(cache.authorized_device_ipv4s),
+      relays:
+        Views.Relay.render_many(
+          relays,
+          socket.assigns.session.public_key,
+          socket.assigns.subject.expires_at
+        ),
+      interface:
+        Views.Interface.render(%{
+          socket.assigns.client
+          | account: socket.assigns.subject.account
+        })
+    })
+  end
+
+  defp reinitialize_client(socket) do
+    {:ok, relays} = select_relays(socket)
+    socket = cache_relays(socket, relays)
+
+    init(socket, socket.assigns.cache.connectable_resources, relays)
+    track_presence(socket)
+  end
+
   defp generate_preshared_key(client, client_public_key, gateway, gateway_public_key) do
     Portal.Crypto.psk(client, client_public_key, gateway, gateway_public_key)
   end
@@ -1124,22 +1145,27 @@ defmodule PortalAPI.Client.Channel do
   defp handle_change(
          %Change{
            op: :update,
-           old_struct: %Portal.Client{} = old_client,
-           struct: %Portal.Client{id: client_id} = client
+           old_struct: %Portal.Device{id: client_id} = old_client,
+           struct: %Portal.Device{id: client_id} = client
          },
          %{assigns: %{client: %{id: id} = current_client}} = socket
        )
        when id == client_id do
-    # Update socket with the new client state, preserving loaded associations
+    # Update socket with the new client state, preserving associations from the current socket.
     updated_client = %{
       client
       | account: current_client.account,
-        actor: current_client.actor,
-        ipv4_address: current_client.ipv4_address,
-        ipv6_address: current_client.ipv6_address
+        actor: current_client.actor
     }
 
     socket = assign(socket, :client, updated_client)
+
+    socket =
+      if old_client.ipv4 != client.ipv4 or old_client.ipv6 != client.ipv6 do
+        reinitialize_client(socket)
+      else
+        socket
+      end
 
     # Changes in client verification can affect the list of allowed resources
     if old_client.verified_at != client.verified_at do
@@ -1156,7 +1182,7 @@ defmodule PortalAPI.Client.Channel do
   end
 
   defp handle_change(
-         %Change{op: :delete, old_struct: %Portal.Client{id: id}},
+         %Change{op: :delete, old_struct: %Portal.Device{id: id}},
          %{assigns: %{client: %{id: client_id}}} = socket
        )
        when id == client_id do
@@ -1361,12 +1387,12 @@ defmodule PortalAPI.Client.Channel do
 
   defp async_create_policy_authorization(
          policy_authorization_id,
-         %Portal.Client{
+         %Portal.Device{
            id: client_id,
            account_id: account_id,
            actor_id: actor_id
          },
-         %Portal.Gateway{
+         %{
            id: gateway_id,
            account_id: account_id
          } = gateway,
@@ -1390,8 +1416,8 @@ defmodule PortalAPI.Client.Channel do
       id: policy_authorization_id,
       token_id: token_id,
       policy_id: policy_id,
-      client_id: client_id,
-      gateway_id: gateway_id,
+      initiating_device_id: client_id,
+      receiving_device_id: gateway_id,
       resource_id: resource_id,
       membership_id: membership_id,
       account_id: account_id,
@@ -1419,8 +1445,8 @@ defmodule PortalAPI.Client.Channel do
           reason: :changeset_error,
           changeset_errors: inspect(changeset.errors),
           policy_id: attrs.policy_id,
-          client_id: attrs.client_id,
-          gateway_id: attrs.gateway_id,
+          initiating_device_id: attrs.initiating_device_id,
+          receiving_device_id: attrs.receiving_device_id,
           resource_id: attrs.resource_id,
           membership_id: attrs.membership_id
         )
@@ -1430,8 +1456,8 @@ defmodule PortalAPI.Client.Channel do
           policy_authorization_id: attrs.id,
           reason: inspect(reason),
           policy_id: attrs.policy_id,
-          client_id: attrs.client_id,
-          gateway_id: attrs.gateway_id,
+          initiating_device_id: attrs.initiating_device_id,
+          receiving_device_id: attrs.receiving_device_id,
           resource_id: attrs.resource_id,
           membership_id: attrs.membership_id
         )
@@ -1443,8 +1469,8 @@ defmodule PortalAPI.Client.Channel do
         reason: Exception.message(exception),
         stacktrace: Exception.format_stacktrace(__STACKTRACE__),
         policy_id: attrs.policy_id,
-        client_id: attrs.client_id,
-        gateway_id: attrs.gateway_id,
+        initiating_device_id: attrs.initiating_device_id,
+        receiving_device_id: attrs.receiving_device_id,
         resource_id: attrs.resource_id,
         membership_id: attrs.membership_id
       )
@@ -1454,7 +1480,7 @@ defmodule PortalAPI.Client.Channel do
     import Ecto.Changeset
 
     fields =
-      ~w[id token_id policy_id client_id receiving_client_id gateway_id resource_id membership_id
+      ~w[id token_id policy_id initiating_device_id receiving_device_id resource_id membership_id
                 account_id
                 expires_at
                 client_remote_ip client_user_agent
@@ -1462,9 +1488,7 @@ defmodule PortalAPI.Client.Channel do
 
     %Portal.PolicyAuthorization{}
     |> cast(attrs, fields)
-    |> validate_required(
-      fields -- [:membership_id, :receiving_client_id, :gateway_id, :gateway_remote_ip]
-    )
+    |> validate_required(fields -- [:membership_id, :gateway_remote_ip])
     |> Portal.PolicyAuthorization.changeset()
   end
 
@@ -1509,12 +1533,8 @@ defmodule PortalAPI.Client.Channel do
 
       sup_pid ->
         session_meta = %{
-          ipv4:
-            socket.assigns.client.ipv4_address &&
-              socket.assigns.client.ipv4_address.address.address,
-          ipv6:
-            socket.assigns.client.ipv6_address &&
-              socket.assigns.client.ipv6_address.address.address,
+          ipv4: socket.assigns.client.ipv4 && socket.assigns.client.ipv4.address,
+          ipv6: socket.assigns.client.ipv6 && socket.assigns.client.ipv6.address,
           name: socket.assigns.client.name,
           public_key: socket.assigns.session.public_key,
           psk_base: socket.assigns.client.psk_base

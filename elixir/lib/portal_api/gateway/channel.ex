@@ -5,6 +5,7 @@ defmodule PortalAPI.Gateway.Channel do
 
   alias Portal.{
     Cache,
+    Device,
     PG,
     Changes.Change,
     PubSub,
@@ -407,8 +408,8 @@ defmodule PortalAPI.Gateway.Channel do
             socket.assigns.gateway.site_id,
             socket.assigns.gateway.id,
             socket.assigns.session.public_key,
-            socket.assigns.gateway.ipv4_address.address,
-            socket.assigns.gateway.ipv6_address.address,
+            socket.assigns.gateway.ipv4,
+            socket.assigns.gateway.ipv6,
             preshared_key,
             ice_credentials
           }
@@ -569,6 +570,15 @@ defmodule PortalAPI.Gateway.Channel do
     })
   end
 
+  defp reinitialize_gateway(socket) do
+    {:ok, relays} = select_relays(socket)
+    socket = cache_relays(socket, relays)
+    account = Database.get_account_by_id!(socket.assigns.gateway.account_id)
+
+    init(socket, account, relays)
+    socket
+  end
+
   ##########################################
   #### Handling changes from the domain ####
   ##########################################
@@ -598,8 +608,8 @@ defmodule PortalAPI.Gateway.Channel do
            op: :delete,
            old_struct:
              %Portal.PolicyAuthorization{
-               gateway_id: gateway_id,
-               client_id: client_id,
+               receiving_device_id: gateway_id,
+               initiating_device_id: client_id,
                resource_id: resource_id
              } =
                policy_authorization
@@ -662,8 +672,31 @@ defmodule PortalAPI.Gateway.Channel do
 
   defp handle_change(
          %Change{
+           op: :update,
+           old_struct: %Device{id: gateway_id} = old_gateway,
+           struct: %Device{id: gateway_id} = gateway
+         },
+         %{
+           assigns: %{gateway: %{id: gateway_id} = current_gateway}
+         } = socket
+       ) do
+    gateway = %{gateway | site: current_gateway.site}
+    socket = assign(socket, :gateway, gateway)
+
+    socket =
+      if old_gateway.ipv4 != gateway.ipv4 or old_gateway.ipv6 != gateway.ipv6 do
+        reinitialize_gateway(socket)
+      else
+        socket
+      end
+
+    {:noreply, socket}
+  end
+
+  defp handle_change(
+         %Change{
            op: :delete,
-           old_struct: %Portal.Gateway{id: gateway_id}
+           old_struct: %Device{id: gateway_id}
          },
          %{
            assigns: %{gateway: %{id: gateway_id}}
